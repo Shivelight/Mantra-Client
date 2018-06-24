@@ -72,7 +72,8 @@ async def dadjoke(self, msg, args):
             "「 Dad Joke 」\n"
             "Dad is busy, try again later.."))
     else:
-        await self.sendText(msg.to, f"「 Dad Joke 」\n{result.text}")
+        joke = await result.text()
+        await self.sendText(msg.to, f"「 Dad Joke 」\n{joke}")
 
 
 @plugin(group='Fun')
@@ -102,7 +103,7 @@ async def lyric(self, msg, args):
     result = await self.session.get("https://api.genius.com/search",
                                     params=params, headers=headers)
     if result.status_code == 200:
-        js = result.json()
+        js = await result.json()
         if js['response']['hits'] and js['response']['hits'][0]['type'] == 'song':
             page = await self.session.get(js['response']['hits'][0]['result']['url'])
             html = BeautifulSoup(page.text, "html.parser")

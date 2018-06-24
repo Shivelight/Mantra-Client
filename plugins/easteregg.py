@@ -26,7 +26,7 @@ async def mantra(self, msg, args):
         "          \U00100402\U0010018a\U0010ffff")
 
 
-@plugin(in_help=False)
+#@plugin(in_help=False)
 async def debug(self, msg, args):
     if len(args) == 1:
         await self.sendText(msg.to, (

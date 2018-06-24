@@ -2,27 +2,21 @@ from threading import Thread
 from contextlib import suppress
 import os
 import asyncio
-import logging
+import time
+import atexit
 
-from colorlog import ColoredFormatter
+from async_timeout import timeout
 from poseur import Client
+from poseur.constants import MsgEncoding
+from mantra import logger
+from mantra.service.ttypes import ErrorCode, TalkException
 import ujson as json
 
 from se import MantraSE
 
-LOG_LEVEL = logging.DEBUG
-LOGFORMAT = (
-    "[%(log_color)s%(levelname)s%(reset)s] "
-    "%(log_color)s%(message)s%(reset)s"
-)
-logging.root.setLevel(LOG_LEVEL)
-formatter = ColoredFormatter(LOGFORMAT)
-stream = logging.StreamHandler()
-stream.setLevel(LOG_LEVEL)
-stream.setFormatter(formatter)
-log = logging.getLogger("MantraClient")
-log.setLevel(LOG_LEVEL)
-log.addHandler(stream)
+
+Client.encoder = MsgEncoding.MESSAGE_PACK
+log = logger.get_logger("MantraClient")
 
 
 def expose(func):
@@ -38,11 +32,18 @@ class MantraClient(object):
         self.bind = bind
         self.client = {}
         self.stopped = True
-
-        if not os.path.exists("data"):
-            os.makedirs("data")
-
         self.connect()
+
+        if not os.path.exists(f"data/{self.username}"):
+            os.makedirs(f"data/{self.username}")
+
+        self.local_storage = f"data/{self.username}"
+
+        def cleanup():
+            if not self.loop.is_running():
+                self.loop.run_until_complete(self.server.unregister(self.username))
+
+        atexit.register(cleanup)
 
     def start(self):
         self.stopped = False
@@ -70,62 +71,74 @@ class MantraClient(object):
         self.server.connect(self.bind)
 
     async def _poll(self):
+        # When registering, server will ask for sync_setting
         clients = await self.server.register(self.username, self.password)
         if clients["status"] == "ok":
             log.info(f"Connected to {self.bind} as {self.username}")
             for client in clients["message"]:
                 try:
                     await self.start_client(client)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.exception(e)
         else:
             log.warn(f"Cannot connect to {self.bind} : {clients['message']}")
 
+        retires = 0  # start from 1 because of the current logic
         while not self.stopped:
             try:
-                await asyncio.wait_for(self.server.beat(self.username), 10)
+                async with timeout(5):
+                    await self.server.beat(self.username)
             except asyncio.TimeoutError:
-                log.warn("Server is not responding, reconnecting..")
+                log.warn(f"Server is not responding, reconnecting.. ({retires})")
                 self.connect()
+                # re-register just in case the server can't keep up
+                await self.server.register(self.username, self.password)
+                await asyncio.sleep(2 * retires)
+                # limit the interval to 10 minutes
+                retires = min(retires + 1, 300)
             else:
                 await self.sync_setting()
-                await asyncio.sleep(5)
+                await asyncio.sleep(2)
+                retires = 0  # reset the retries if success
 
     @expose
     async def start_client(self, data):
-        se = MantraSE(helper=self)
-        if data["setting"]:
-            # load data received from the server
-            se._setting.update(json.loads(data["setting"]))
-        else:
-            return
-
-        # done = [False]
-        # print(11)
-
-        # def login():
-        #     print(3)
-        #     asyncio.set_event_loop(se.loop)
-        #     se.loop.run_until_complete(se.login(token=se.authToken, clientType="ipad"))
-        #     done[0] = True
-        #     print(33)
-
-        # t = Thread(target=login)
-        # t.daemon = True
-        # t.start()
-
-        # while not done[0]:
-        #     await asyncio.sleep(2)
+        try:
+            setting = json.loads(data["setting"])
+            if setting["auth"]["token"]:
+                # load data received from the server
+                se = MantraSE(helper=self)
+                se._setting.update(setting)
+            else:
+                return {"status": "err", "message": "Token is null."}
+        except json.decoder.JSONDecodeError:
+            return {"status": "err", "message": "No data."}
 
         # Run client loop on another thread. Running two event-loop on the
-        # same thread is not guaranteed to work
-        await self.loop.run_in_executor(
+        # same thread is not guaranteed to work.
+        future = self.loop.run_in_executor(
             None,
             se.loop.run_until_complete,
             se.login(token=se.authToken, clientType="ipad"),
         )
+
+        try:
+            await future
+        except TalkException as e:
+            if e.code in (
+                ErrorCode.AUTHENTICATION_FAILED,
+                ErrorCode.NOT_AVAILABLE_USER,
+                ErrorCode.NOT_AUTHORIZED_DEVICE,
+                ErrorCode.INTERNAL_ERROR,
+            ):
+                se.authToken = None
+                await self.save_setting(data["mid"], se._setting)
+                se.session._connector.close()
+                return
+
         status = se.start()
         if status == -1:
+            se.session._connector.close()
             return {"status": "err", "message": "Cannot start client."}
 
         self.client[data["mid"]] = se
@@ -150,24 +163,45 @@ class MantraClient(object):
         if mid in self.client:
             return {"status": "ok", "message": ""}
         else:
-            return {"status": "err", "message": "Mid not found."}
+            return {"status": "err", "message": f"{mid} not found."}
 
     @expose
     async def sync_setting(self):
-        cached = os.listdir('data')
+        cached = os.listdir(self.local_storage)
         for c in cached:
-            with open(f"data/{c}") as file:
+            with open(f"{self.local_storage}/{c}") as file:
                 try:
                     data = json.load(file)
                 except ValueError:
                     log.warn(f"Incorrect json at {c}, skipping..")
                     continue
+            log.info(f"{c} saving..")
             await self.save_setting(c, data)
-            os.remove(f"data/{c}")
+            os.remove(f"{self.local_storage}/{c}")
 
     @expose
-    def sub_add(self, mid):
-        pass
+    async def subclient(self, mid, ms):
+        try:
+            curr_time = time.time()
+            curr_sub = self.client[mid]._setting["subscription"]
+            new_sub = curr_sub + ms
+
+            # I lost myself here, please help
+            if new_sub > curr_sub:
+                if curr_time < curr_sub:
+                    self.client[mid]._setting["subscription"] = new_sub
+                elif curr_time > curr_sub:
+                    self.client[mid]._setting["subscription"] = curr_time + ms
+            elif curr_sub > curr_time and new_sub > curr_time:
+                self.client[mid]._setting["subscription"] = new_sub
+            else:
+                return {"status": "err", "message": "EXPIRED"}
+        except KeyError:
+            return {"status": "err", "message": f"{mid} not found."}
+        else:
+            await self.save_setting(mid, self.client[mid]._setting)
+            res = self.client[mid]._setting["subscription"]
+            return {"status": "ok", "message": (res)}
 
     @expose
     def status(self):
@@ -186,15 +220,28 @@ class MantraClient(object):
         pass
 
     async def save_setting(self, mid, setting):
+        # Sync before saving a new one
         try:
-            await asyncio.wait_for(
-                self.server.save_setting(self.username, mid, setting), 10
-            )
-            log.info(f"{mid} saved to cloud.")
+            # await asyncio.wait_for(
+            #     self.server.save_setting(self.username, mid, setting), 10
+            # )
+            async with timeout(5):
+                res = await self.server.save_setting(self.username, mid, setting)
+            if res["status"] == "ok":
+                log.info(f"{mid} saved to cloud.")
+            elif res["status"] == "err":
+                log.warn(f"Error saving {mid}: {res['message']}")
         except asyncio.TimeoutError:
             log.warn("Server is not responding, saving locally.")
-            with open(f"data/{mid}", "w+") as file:
+            with open(f"{self.local_storage}/{mid}", "w+") as file:
                 json.dump(setting, file, ensure_ascii=False)
+
+    async def purge(self, mid):
+        try:
+            async with timeout(5):
+                await self.server.delete_user(mid)
+        except asyncio.TimeoutError:
+            pass
 
     def get(self, name):
         func = getattr(self, name)
@@ -202,3 +249,7 @@ class MantraClient(object):
             return func
         else:
             return None
+
+    @staticmethod
+    def reload_processor():
+        MantraSE.reload_processor()

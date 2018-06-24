@@ -2,7 +2,7 @@
 import time
 import asyncio
 
-from mantra.util import parseMention
+from mantra.util import parseMention, buildMention
 from mantra.service.ttypes import TalkException, Message
 
 from .util import util
@@ -13,22 +13,21 @@ from .util.pl import plugin
 async def about(self, msg, args):
     await self.sendText(msg.to, (
         "「 About 」\n"
-        "Mantra SE♪\n"
-        "A mantra for self control♪\n"
+        "Mantra SEॐ\n"
+        "A mantra for self control.\n"
         "\n"
         "「 Subscription 」\n"
         "Expired in: {}\n"
-        "Server: {}\n"
-        "Instance: {}\n"
         "Key: {}\n"
+        "Instance: {}"
         "\n"
         "「 Contact 」\n"
         "・ LINE: line://ti/p/~flysbee_\n"
         "\n"
-        "︙MantraSE-{}♪"
+        "︙MantraSE-{}ॐ"
     ).format(
         util.timeUnit(int(self._setting['subscription'] - time.time())),
-        self.server, self.instance, self.key.title(), self.version))
+        self.key.title(), self.helper.username, self.version))
 
 
 @plugin()
@@ -153,7 +152,7 @@ async def mentionall(self, msg, args):
         base = ("「 Mention 」{}").format(
             "\n・@!" * len(chunk)
         )
-        mention = util.buildMention(base, chunk)
+        mention = buildMention(base, chunk)
         message = Message(to=msg.to, text=base,
                           contentType=0,
                           contentMetadata=mention)

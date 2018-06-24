@@ -205,7 +205,7 @@ async def myprofile(self, msg, args):
                                    for c in self._state['wait']['type']]
                         await self.sendText(msg.to, (
                             "「 Profile 」\nWaiting for {}.."
-                        )).format(', '.join(waiting))
+                        ).format(', '.join(waiting)))
                 else:
                     if task is None:
                         await self.sendText(msg.to, "「 Profile 」\nAborted..")

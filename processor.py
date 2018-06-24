@@ -4,6 +4,8 @@ from importlib import reload, import_module
 from os.path import basename
 from collections import defaultdict
 import glob
+import time
+import asyncio
 
 from multidict import CIMultiDict
 
@@ -75,6 +77,32 @@ async def SEND_MESSAGE(self, op):
             return
         lenn = len(self.key)
         if op.message.text[0:lenn].lower() == self.key:
+            now = time.time()
+            if now > self._setting["subscription"]:
+                det = now - self._setting["subscription"]
+                if det < self.grace_period:
+                    await self.sendText(
+                        op.message.to,
+                        (
+                            "「 Mantra 」\n"
+                            "Your account is currently in grace period.\n"
+                            "Renew your subscription as soon as possible "
+                            "to avoid getting purged."
+                        ),
+                    )
+                    if lenn == 0:
+                        self._setting["key"] = "mantra"
+                        self.saveSetting()
+                        await self.sendText(op.message.to, "Key has been set to Mantra")
+                    return
+                else:
+                    self.purged = True
+                    self.stop()
+                    if self.helper is not None:
+                        coro = self.helper.purge(self.mid)
+                        asyncio.run_coroutine_threadsafe(coro, self.helper.loop)
+                    await self.sendText(op.message.to, "Your account has been purged.")
+                    return
             cmd = op.message.text[lenn:].split(maxsplit=2)
             try:
                 await self.commands[cmd[0]](self, op.message, cmd)
@@ -136,8 +164,8 @@ async def RECEIVE_MESSAGE(self, op):
 async def NOTIFIED_READ_MESSAGE(self, op):
     try:
         if (
-            op.param2 not in self._var["lurk"][op.param1]["exclude"]
-            and op.param2 not in self._var["lurk"][op.param1]["lurker"]
+            op.param2 not in self._var["lurk"][op.param1]["exclude"] and
+            op.param2 not in self._var["lurk"][op.param1]["lurker"]
         ):
             self._var["lurk"][op.param1]["lurker"].append(op.param2)
     except KeyError:

@@ -1,27 +1,17 @@
 # -*- coding: utf-8 -*-
-import logging
 import time
 import asyncio
 from contextlib import suppress
 from threading import Thread
 from importlib import reload
 
-from colorlog import ColoredFormatter
 from mantra import mantra
+from mantra.logger import get_logger
 from mantra.service.ttypes import ErrorCode, TalkException
 
 import processor
 
-LOG_LEVEL = logging.DEBUG
-LOGFORMAT = "[%(log_color)s%(levelname)s%(reset)s] " "%(log_color)s%(message)s%(reset)s"
-logging.root.setLevel(LOG_LEVEL)
-formatter = ColoredFormatter(LOGFORMAT)
-stream = logging.StreamHandler()
-stream.setLevel(LOG_LEVEL)
-stream.setFormatter(formatter)
-log = logging.getLogger("KontjeLog")
-log.setLevel(LOG_LEVEL)
-log.addHandler(stream)
+log = get_logger("MantraSE")
 
 
 async def noop(*args, **kwargs):
@@ -85,20 +75,23 @@ class MantraSE(mantra.Mantra):
         asyncio.set_event_loop(self.loop)
         self.loop.run_until_complete(self._poll())
         self.stopped = True
-        pending = asyncio.Task.all_tasks()
+
+        # Copy to avoid set being changed while iterating
+        pending = asyncio.Task.all_tasks(loop=self.loop).copy()
         for task in pending:
             task.cancel()
             with suppress(asyncio.CancelledError):
                 self.loop.run_until_complete(task)
+        self.loop.run_until_complete(self.close())
+        self.helper.stop_client(self.mid)
+        log.info(f"{self.mid} stopped.")
 
     def saveSetting(self):
         if self.mid is None:
             log.warn("Client must be logged in!")
             return
         if self.helper is not None:
-            coro = self.helper.save_setting(
-                self.mid, self._setting
-            )
+            coro = self.helper.save_setting(self.mid, self._setting)
             asyncio.run_coroutine_threadsafe(coro, self.helper.loop)
             # setting = fut.result(10)
             # if setting["result"] == "err":
@@ -107,7 +100,7 @@ class MantraSE(mantra.Mantra):
             # else:
             #     log.info(f"{self.mid} saved to cloud.")
 
-    def start(self, block=False):
+    def start(self):
         if self.authToken is None:
             log.warn("({}) Not logged in!".format(self.key.title()))
             return -1
@@ -116,9 +109,9 @@ class MantraSE(mantra.Mantra):
             t = Thread(target=self.run)
             t.daemon = True
             t.start()
-            log.info("({}) Started!".format(self.key.title()))
+            log.info(f"{self.mid} started!")
         else:
-            log.warn("({}) Already started!".format(self.key.title()))
+            log.info(f"{self.mid} already started!")
 
     def stop(self):
         self._polling = False
@@ -176,26 +169,13 @@ class MantraSE(mantra.Mantra):
                     ErrorCode.NOT_AUTHORIZED_DEVICE,
                     ErrorCode.INTERNAL_ERROR,
                 ):
-                    self.stop()
+                    self.authToken = None
+                    self._polling = False
             except Exception as e:
                 log.exception(e)
-            finally:
-                self.saveSetting()
-                pending = asyncio.Task.all_tasks()
-                for task in pending:
-                    task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await task
 
-        log.info("Goodbye!")
-
-    async def _processor(self, op):
-        if self._var["debug"]:
-            print("")
-            log.debug(op)
-            print("")
-
-        await self.operation.get(op.type, noop)(self, op)
+        if not hasattr(self, "purged"):
+            self.saveSetting()
 
     @staticmethod
     def load_processor(proc):
